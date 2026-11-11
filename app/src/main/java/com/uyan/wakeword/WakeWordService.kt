@@ -11,7 +11,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
-import android.media.AudioAttributes
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -306,10 +305,7 @@ class WakeWordService : Service() {
             Log.w(TAG, "TTS hazır olmadığı için sesli bildirim yapılamadı: $text")
             return
         }
-        tts?.audioAttributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .build()
+        // TTS varsayılan olarak ortam (medya) kanalından ses verir
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "uyan_tts")
     }
 
