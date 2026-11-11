@@ -50,8 +50,3 @@ jobs:
             app/build/outputs/apk/debug/*.apk
             **/build/outputs/apk/debug/*.apk
           if-no-files-found: warn
-        uses: actions/upload-artifact@v4
-        with:
-          name: uyan-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: warn
