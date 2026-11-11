@@ -39,12 +39,21 @@
         android:layout_height="wrap_content"
         android:text="Batarya Optimizasyonunu Kapat"
         android:textSize="14sp"
+        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+        android:layout_marginBottom="16dp" />
+
+    <Button
+        android:id="@+id/overlayButton"
+        android:layout_width="220dp"
+        android:layout_height="wrap_content"
+        android:text="Ekran Üstünde Gösterme İzni"
+        android:textSize="14sp"
         style="@style/Widget.MaterialComponents.Button.OutlinedButton" />
 
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Not: İlk kullanımda mikrofon izni verin.\nModel dosyası (uyan.onnx) assets klasöründe olmalıdır."
+        android:text="\"uyan\" deyince ekran yanar, Termux açılır,\n\"Termux açıldı\" diye sesli bildirir."
         android:textColor="#888888"
         android:textSize="13sp"
         android:gravity="center"

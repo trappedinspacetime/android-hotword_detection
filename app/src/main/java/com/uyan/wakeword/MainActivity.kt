@@ -20,6 +20,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var toggleButton: Button
     private lateinit var batteryButton: Button
+    private lateinit var overlayButton: Button
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -46,6 +47,7 @@ class MainActivity : AppCompatActivity() {
         statusText = findViewById(R.id.statusText)
         toggleButton = findViewById(R.id.toggleButton)
         batteryButton = findViewById(R.id.batteryButton)
+        overlayButton = findViewById(R.id.overlayButton)
 
         toggleButton.setOnClickListener {
             if (isServiceRunning()) {
@@ -57,6 +59,25 @@ class MainActivity : AppCompatActivity() {
 
         batteryButton.setOnClickListener {
             requestBatteryOptimizationExemption()
+        }
+
+        // "Uyan" kelimesiyle açıldıysa ekran üstü izin önemli
+        overlayButton.setOnClickListener {
+            if (Settings.canDrawOverlays(this)) {
+                Toast.makeText(this, "Bu izin zaten verildi", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(
+                    this,
+                    "Listeden Uyan Wake Word'i bulup \"Diğer uygulamaların üzerinde göster\" iznini açın",
+                    Toast.LENGTH_LONG
+                ).show()
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+            }
         }
 
         // Wake word'ten geldiyse
