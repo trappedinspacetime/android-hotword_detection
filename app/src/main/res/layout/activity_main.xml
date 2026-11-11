@@ -53,7 +53,7 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="\"uyan\" deyince ekran yanar, Termux açılır,\n\"Termux açıldı\" diye sesli bildirir."
+        android:text="uyan deyince ekran yanar, Termux açılır ve Termux açıldı diye sesli bildirir."
         android:textColor="#888888"
         android:textSize="13sp"
         android:gravity="center"
