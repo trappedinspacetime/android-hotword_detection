@@ -1,5 +1,6 @@
 package com.uyan.wakeword
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -14,25 +15,49 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.speech.tts.TextToSpeech
+import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.rementia.openwakeword.lib.WakeWordEngine
 import com.rementia.openwakeword.lib.model.WakeWordModel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.Locale
 
 /**
  * Sürekli çalışan foreground service.
- * Mikrofon yönetimi ekran durumuna göredir:
- *  - Ekran KAPALI: "uyan" kelimesini dinler (mikrofonu alır)
- *  - Ekran AÇIK  : mikrofonu BIRAKIR; böylece Hey Google,
+ *
+ * Mikrofon yönetimi ekran durumuna ve arama durumuna göredir:
+ *  - Ekran KAPALI + arama YOK : "uyan" kelimesini dinler (mikrofonu alır)
+ *  - Ekran AÇIK               : mikrofonu BIRAKIR; böylece Hey Google,
  *    Termux'taki sesle erişim programı vb. mikrofonu kullanabilir
+ *  - Arama var (RINGING/OFFHOOK) : mikrofonu KENDİMİZ bırakırız; Telecom ile
+ *    çakışma olmaz, "Failed to initialize AudioRecord" hatası hiç oluşmaz
+ *  - Arama bitince (IDLE)     : ekran kapalıysa dinleme ~3 sn sonra geri gelir
+ *
+ * Bu dosyadaki dayanıklılık korumaları (arama sonrası ölümün çözümü):
+ *  1. CoroutineExceptionHandler : yakalanmayan hata process'i artık ÖLDÜRMEZ
+ *     (eskiden arama sırasında mic alınca fırlayan hata uygulamayı öldürüyordu)
+ *  2. Retry'li başlatma         : mikrofon o an kapaysa geri çekilerek (backoff)
+ *     yeniden dener; artık "ekran kapanınca dener" deyip susmuyor
+ *  3. detections .catch         : algılama akışı ölürse sessizce yeniden başlatır
+ *  4. cancelAndJoin'li kapatma  : bırakma/inference yarışında native çökme olmaz
+ *  5. Watchdog (60 sn)          : servis bir şekilde sustuysa kendi kendine toparlar
+ *  6. onTaskRemoved             : son uygulamalardan kaydırılırsa 5 sn sonra geri gelir
  *
  * "uyan" duyulunca: ekranı uyandırır, Termux'u açar,
  * "Termux açıldı" diye sesli bildirir (Google TTS).
@@ -45,6 +70,11 @@ class WakeWordService : Service() {
         private const val TAG = "UyanWakeWord"
         private const val TERMUX_PACKAGE = "com.termux"
         private const val TERMUX_ACTIVITY = "com.termux.app.TermuxActivity"
+
+        // YENİ: dayanıklılık ayarları
+        private const val MAX_START_ATTEMPTS = 30         // start() için deneme sayısı
+        private const val WATCHDOG_INTERVAL_MS = 60_000L  // kendi kendine toparlama aralığı
+        private const val CALL_RESUME_DELAY_MS = 3_000L   // arama bitince bekleme süresi
 
         fun start(context: Context) {
             val intent = Intent(context, WakeWordService::class.java)
@@ -60,11 +90,41 @@ class WakeWordService : Service() {
         }
     }
 
+    // YENİ: mikrofonun o anki durumu
+    private enum class MicState {
+        LISTENING,    // dinliyoruz
+        RELEASED,     // boşta (ekran açık veya dinleme yok)
+        PAUSED_CALL,  // arama sürüyor, arama bitince otomatik devam edecek
+        RECOVERING    // dinleme başlatılmaya çalışılıyor (retry döngüsü çalışıyor)
+    }
+
+    @Volatile
     private var engine: WakeWordEngine? = null
+    @Volatile
     private var detectionJob: Job? = null
-    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private var startJob: Job? = null       // YENİ: başlatma/retry döngüsü
+    private var watchdogJob: Job? = null    // YENİ: kendi kendine toparlama
+
+    @Volatile
+    private var micState: MicState = MicState.RELEASED   // YENİ
+
+    // DEĞİŞTİ: CoroutineExceptionHandler eklendi. Eskiden bu scope'a düşen bir
+    // hata process'i öldürüyordu (arama sonrası ölümün asıl nedeni);
+    // artık sadece loglanıyor ve servis çalışmaya devam ediyor.
+    private val serviceScope = CoroutineScope(
+        Dispatchers.Default + SupervisorJob() +
+                CoroutineExceptionHandler { _, e ->
+                    Log.e(TAG, "Yakalanmayan hata (servis çalışmaya devam ediyor)", e)
+                }
+    )
+
+    // YENİ: engine başlatma/durdurma işlemlerini sıraya koyar; iki işlemin
+    // aynı anda engine'e dokunması (native çökme riski) engellenir
+    private val micMutex = Mutex()
+
     private var wakeLock: PowerManager.WakeLock? = null
     private var screenReceiver: BroadcastReceiver? = null
+    private var phoneReceiver: BroadcastReceiver? = null   // YENİ
 
     // Sesli yanıt için TTS
     private var tts: TextToSpeech? = null
@@ -93,6 +153,10 @@ class WakeWordService : Service() {
 
         // Ekran açılıp kapanmasını izle ve mikrofonu buna göre yönet
         registerScreenReceiver()
+        // YENİ: arama başlayınca/bitinca mikrofonu yönet
+        registerPhoneStateReceiver()
+        // YENİ: kendi kendine toparlama güvenlik ağı
+        startWatchdog()
         applyMicPolicy()
 
         return START_STICKY
@@ -106,7 +170,7 @@ class WakeWordService : Service() {
             addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_SCREEN_ON)
         }
-        screenReceiver = object : BroadcastReceiver() {
+        val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 when (intent?.action) {
                     Intent.ACTION_SCREEN_OFF -> {
@@ -120,7 +184,47 @@ class WakeWordService : Service() {
                 }
             }
         }
-        registerReceiver(screenReceiver, filter)
+        screenReceiver = receiver
+        registerReceiver(receiver, filter)
+    }
+
+    // ---- YENİ: arama durumuna göre mikrofon yönetimi ----
+    // PHONE_STATE broadcast'i izin gerektirmez; sadece arama durumu okunur.
+
+    private fun registerPhoneStateReceiver() {
+        if (phoneReceiver != null) return
+        val filter = IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.getStringExtra(TelephonyManager.EXTRA_STATE)) {
+                    TelephonyManager.EXTRA_STATE_RINGING,
+                    TelephonyManager.EXTRA_STATE_OFFHOOK -> {
+                        // Arama çalıyor veya görüşme sürüyor:
+                        // mikrofonu kendimiz bırakırız → Telecom çakışmaz
+                        Log.i(TAG, "Arama aktif → mikrofon bırakılır")
+                        releaseMic(pauseForCall = true)
+                    }
+                    TelephonyManager.EXTRA_STATE_IDLE -> {
+                        // Arama bitti (kapandı, cevaplanıp bitti veya kaçtı)
+                        Log.i(TAG, "Arama bitti (IDLE)")
+                        if (micState == MicState.PAUSED_CALL) {
+                            micState = MicState.RELEASED
+                            // AudioRecord'in sistem tarafında serbest kalması
+                            // için kısa bir bekleme; sonra dinleme geri gelir
+                            serviceScope.launch {
+                                delay(CALL_RESUME_DELAY_MS)
+                                if (micState == MicState.RELEASED && !screenIsOn()) {
+                                    Log.i(TAG, "Arama sonrası dinleme yeniden başlatılıyor")
+                                    takeMic()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        phoneReceiver = receiver
+        registerReceiver(receiver, filter)
     }
 
     private fun screenIsOn(): Boolean =
@@ -136,67 +240,207 @@ class WakeWordService : Service() {
         }
     }
 
-    /** Mikrofonu al ve "uyan"ı dinlemeye başla */
+    /** Mikrofonu al ve "uyan"ı dinlemeye başla (DEĞİŞTİ: retry'li başlatma) */
     private fun takeMic() {
-        if (engine != null) return // zaten dinliyor
-        startListening()
+        if (micState == MicState.LISTENING) return   // zaten dinliyor
+        if (micState == MicState.PAUSED_CALL) {      // arama sürüyor
+            Log.i(TAG, "Arama sürüyor; dinleme arama bitince başlayacak")
+            return
+        }
+        requestStart()
+    }
+
+    /** YENİ: tüm başlatmalar tek noktadan ve tek job üzerinden yapılır */
+    private fun requestStart() {
+        micState = MicState.RECOVERING
+        startJob?.cancel()
+        startJob = serviceScope.launch {
+            micMutex.withLock {
+                startListeningWithRetry()
+            }
+        }
     }
 
     /** Mikrofonu bırak: başka uygulama (sesle erişim, Hey Google) kullanabilsin */
-    private fun releaseMic() {
-        detectionJob?.cancel()
-        detectionJob = null
-        try {
-            engine?.stop()
-        } catch (e: Exception) {
-            Log.w(TAG, "engine.stop() hatası", e)
+    private fun releaseMic(pauseForCall: Boolean = false) {
+        micState = if (pauseForCall) MicState.PAUSED_CALL else MicState.RELEASED
+        startJob?.cancel()
+        startJob = null
+        // Engine'i güvenle kapat: collector iptal edilip bitmesi beklenir,
+        // sonra stop/release çağrılır (native çökme yarışı önlenir)
+        serviceScope.launch {
+            micMutex.withLock {
+                // Bu stop güncelliğini yitirdiyse (ardından tekrar dinleme
+                // başlatıldıysa) dokunma; taze engine'i öldürme
+                if (micState == MicState.RELEASED || micState == MicState.PAUSED_CALL) {
+                    stopEngineSafely()
+                }
+            }
         }
-        try {
-            engine?.release()
-        } catch (e: Exception) {
-            Log.w(TAG, "engine.release() hatası", e)
-        }
-        engine = null
-        updateNotification("Beklemede (ekran açık, mikrofon boşta)")
+        updateNotification(
+            if (pauseForCall) "Arama sürüyor; mikrofon boşta"
+            else "Beklemede (ekran açık, mikrofon boşta)"
+        )
     }
 
-    private fun startListening() {
-        // Model dosyası assets/uyan.onnx olmalı
-        val models = listOf(
-            WakeWordModel(
-                name = "uyan",
-                modelPath = "uyan.onnx",
-                threshold = 0.45f
-            )
-        )
+    /**
+     * YENİ: Engine'i güvenle kapat.
+     * Önce algılama akışını iptal edip BİTMEYİ BEKLERİZ (cancelAndJoin);
+     * böylece inference ortasında native tarafın serbest bırakılması gibi
+     * yarışlar (SIGSEGV) önlenir, ancak ondan sonra stop/release çağrılır.
+     */
+    private suspend fun stopEngineSafely() {
+        detectionJob?.cancelAndJoin()
+        detectionJob = null
+        val e = engine
+        engine = null
+        if (e != null) {
+            try {
+                e.stop()
+            } catch (ex: Exception) {
+                Log.w(TAG, "engine.stop() hatası", ex)
+            }
+            try {
+                e.release()
+            } catch (ex: Exception) {
+                Log.w(TAG, "engine.release() hatası", ex)
+            }
+        }
+    }
 
-        val newEngine = WakeWordEngine(
-            context = this,
-            models = models,
-            detectionCooldownMs = 3000L    // Aynı kelimeyi 3 sn içinde tekrar sayma
-        )
-        engine = newEngine
+    private fun releaseEngineQuietly(e: WakeWordEngine) {
+        try {
+            e.stop()
+        } catch (_: Exception) {
+        }
+        try {
+            e.release()
+        } catch (_: Exception) {
+        }
+    }
 
-        detectionJob?.cancel()
-        detectionJob = serviceScope.launch {
-            newEngine.detections.collect { detection ->
-                Log.i(TAG, "Tespit edildi: ${detection.model.name}  skor=${detection.score}")
-                onWakeWordDetected()
+    /**
+     * YENİ: Dinlemeyi başlat; mikrofon o an başkasındaysa (ör. hâlâ
+     * kapanmamış bir arama) geri çekilerek yeniden dener.
+     * micMutex.withLock İÇİNDE çağrılır (requestStart'e bakın).
+     */
+    private suspend fun startListeningWithRetry() {
+        // Olası eski/kalan engine'i temizle
+        stopEngineSafely()
+
+        var attempt = 0
+        while (micState == MicState.RECOVERING && attempt < MAX_START_ATTEMPTS) {
+            // Bu sırada ekran açıldıysa politikaya göre beklemede kal
+            if (screenIsOn()) {
+                micState = MicState.RELEASED
+                updateNotification("Beklemede (ekran açık, mikrofon boşta)")
+                return
+            }
+            attempt++
+            var newEngine: WakeWordEngine? = null
+            try {
+                // Model dosyası assets/uyan.onnx olmalı
+                val models = listOf(
+                    WakeWordModel(
+                        name = "uyan",
+                        modelPath = "uyan.onnx",
+                        threshold = 0.45f
+                    )
+                )
+                newEngine = WakeWordEngine(
+                    context = this,
+                    models = models,
+                    detectionCooldownMs = 3000L    // Aynı kelimeyi 3 sn içinde tekrar sayma
+                )
+                newEngine.start()                  // Mikrofon başkasındaysa burada exception fırlar
+                engine = newEngine
+                watchDetections(newEngine)
+                micState = MicState.LISTENING
+                Log.i(TAG, "Dinleme başladı (deneme $attempt)")
+                updateNotification("Dinliyor: uyan (ekran kapalı)")
+                return
+            } catch (e: CancellationException) {
+                // releaseMic() vs. çağrıldı → sessizce çık
+                newEngine?.let { releaseEngineQuietly(it) }
+                throw e
+            } catch (e: Exception) {
+                newEngine?.let { releaseEngineQuietly(it) }
+                Log.w(
+                    TAG,
+                    "Dinleme başlatılamadı (deneme $attempt/$MAX_START_ATTEMPTS): ${e.message}"
+                )
+                if (attempt < MAX_START_ATTEMPTS) {
+                    // 2s, 4s, 6s ... en fazla 15s aralıkla yeniden dene
+                    delay(minOf(2_000L * attempt, 15_000L))
+                }
             }
         }
 
-        try {
-            newEngine.start()
-            Log.i(TAG, "Dinleme başladı")
-            updateNotification("Dinliyor: uyan (ekran kapalı)")
-        } catch (e: Exception) {
-            Log.e(TAG, "Engine başlatılamadı", e)
-            try {
-                newEngine.release()
-            } catch (_: Exception) {
+        if (micState == MicState.RECOVERING) {
+            micState = MicState.RELEASED
+            Log.w(TAG, "Dinleme $MAX_START_ATTEMPTS denemede başlatılamadı; watchdog yeniden deneyecek")
+            updateNotification("Mikrofon alınamadı; periyodik olarak yeniden denenecek")
+        }
+    }
+
+    /**
+     * YENİ: Algılama akışını hata korumalı izler.
+     * Eskiden akış içinde bir hata olursa (ör. mikrofon sistem tarafından
+     * zorla alındıysa) handler yoktu → process ölüyordu.
+     * Artık hata loglanır ve dinleme kısa süre sonra sessizce yeniden başlar.
+     */
+    private fun watchDetections(target: WakeWordEngine) {
+        detectionJob = serviceScope.launch {
+            target.detections
+                .catch { e ->
+                    Log.w(TAG, "Algılama akışı hata ile sonlandı: ${e.message}")
+                    if (micState == MicState.LISTENING) {
+                        micState = MicState.RECOVERING
+                        serviceScope.launch {
+                            delay(CALL_RESUME_DELAY_MS)
+                            if (micState == MicState.RECOVERING) {
+                                Log.i(TAG, "Dinleme akış hatası sonrası yeniden başlatılıyor")
+                                requestStart()
+                            }
+                        }
+                    }
+                }
+                .collect { detection ->
+                    Log.i(TAG, "Tespit edildi: ${detection.model.name}  skor=${detection.score}")
+                    onWakeWordDetected()
+                }
+        }
+    }
+
+    // ---- YENİ: kendi kendine toparlama (watchdog) ----
+
+    /**
+     * Her 60 sn'de bir durumu kontrol eder:
+     *  - ekran kapalı ama dinleme yoksa → yeniden başlatır
+     *    (retry döngüsü tükendiğinde veya servis sustuğunda kurtarır)
+     *  - "dinliyoruz" ama engine kaybolmuşsa → yeniden başlatır
+     */
+    private fun startWatchdog() {
+        watchdogJob?.cancel()
+        watchdogJob = serviceScope.launch {
+            while (isActive) {
+                delay(WATCHDOG_INTERVAL_MS)
+                try {
+                    if (screenIsOn()) continue
+                    when {
+                        micState == MicState.RELEASED -> {
+                            Log.w(TAG, "Watchdog: ekran kapalı ama dinleme yok → başlatılıyor")
+                            takeMic()
+                        }
+                        micState == MicState.LISTENING && engine == null -> {
+                            Log.w(TAG, "Watchdog: dinleme durumu tutarsız → yeniden başlatılıyor")
+                            requestStart()
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Watchdog hatası", e)
+                }
             }
-            engine = null
-            updateNotification("Mikrofon şu an başkasında; ekran kapanınca yeniden denenecek")
         }
     }
 
@@ -362,8 +606,42 @@ class WakeWordService : Service() {
         nm.notify(NOTIFICATION_ID, createNotification(text))
     }
 
+    // ---- YENİ: son uygulamalardan kaydırılınca yeniden başlatma ----
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        Log.w(TAG, "Görev sonlandırıldı; servis 5 sn sonra yeniden başlatılacak")
+        try {
+            val restart = Intent(applicationContext, WakeWordService::class.java)
+            val pending = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                PendingIntent.getForegroundService(
+                    applicationContext, 2, restart,
+                    PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+                )
+            } else {
+                PendingIntent.getService(
+                    applicationContext, 2, restart,
+                    PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+                )
+            }
+            val am = getSystemService(AlarmManager::class.java)
+            am.setExactAndAllowWhileIdle(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + 5_000,
+                pending
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Yeniden başlatma planlanamadı", e)
+        }
+    }
+
     override fun onDestroy() {
         Log.i(TAG, "Servis durduruluyor")
+        micState = MicState.RELEASED
+        startJob?.cancel()
+        startJob = null
+        watchdogJob?.cancel()
+        watchdogJob = null
         detectionJob?.cancel()
         detectionJob = null
         try {
@@ -382,6 +660,13 @@ class WakeWordService : Service() {
             }
         }
         screenReceiver = null
+        phoneReceiver?.let {
+            try {
+                unregisterReceiver(it)
+            } catch (_: Exception) {
+            }
+        }
+        phoneReceiver = null
         serviceScope.cancel()
         wakeLock?.let {
             if (it.isHeld) it.release()
