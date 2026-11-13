@@ -58,6 +58,10 @@ import java.util.Locale
  *  4. cancelAndJoin'li kapatma  : bırakma/inference yarışında native çökme olmaz
  *  5. Watchdog (60 sn)          : servis bir şekilde sustuysa kendi kendine toparlar
  *  6. onTaskRemoved             : son uygulamalardan kaydırılırsa 5 sn sonra geri gelir
+ *  7. Periyodik tazeleme (5 dk) : kütüphane içinden bize bildirilmeyen "sessiz
+ *     motor ölümlerine" karşı engine 5 dakikada bir tazelenir
+ *  8. Durum ikonu + kalp atışı  : bildirim ikonu dinleme durumunu gösterir
+ *     (mikrofon = dinliyor); her 60 sn'de durum logcat'e yazılır
  *
  * "uyan" duyulunca: ekranı uyandırır, Termux'u açar,
  * "Termux açıldı" diye sesli bildirir (Google TTS).
@@ -65,7 +69,9 @@ import java.util.Locale
 class WakeWordService : Service() {
 
     companion object {
-        const val CHANNEL_ID = "uyan_wakeword_channel"
+        // v2: kanal importance'ı güncellendiği için kimlik yenilendi
+        // (Android, kanal importance'ını geriye dönük değiştirmeye izin vermez)
+        const val CHANNEL_ID = "uyan_wakeword_channel_v2"
         const val NOTIFICATION_ID = 1001
         private const val TAG = "UyanWakeWord"
         private const val TERMUX_PACKAGE = "com.termux"
@@ -75,6 +81,7 @@ class WakeWordService : Service() {
         private const val MAX_START_ATTEMPTS = 30         // start() için deneme sayısı
         private const val WATCHDOG_INTERVAL_MS = 60_000L  // kendi kendine toparlama aralığı
         private const val CALL_RESUME_DELAY_MS = 3_000L   // arama bitince bekleme süresi
+        private const val RECYCLE_TICKS = 5               // YENİ: 5 tick x 60 sn = 5 dk'da bir engine tazeleme
 
         fun start(context: Context) {
             val intent = Intent(context, WakeWordService::class.java)
@@ -253,6 +260,7 @@ class WakeWordService : Service() {
     /** YENİ: tüm başlatmalar tek noktadan ve tek job üzerinden yapılır */
     private fun requestStart() {
         micState = MicState.RECOVERING
+        updateNotification("Dinleme başlatılıyor...")
         startJob?.cancel()
         startJob = serviceScope.launch {
             micMutex.withLock {
@@ -423,10 +431,37 @@ class WakeWordService : Service() {
     private fun startWatchdog() {
         watchdogJob?.cancel()
         watchdogJob = serviceScope.launch {
+            var listeningTicks = 0
             while (isActive) {
                 delay(WATCHDOG_INTERVAL_MS)
                 try {
+                    // YENİ: kalp atışı — teşhis için durum her 60 sn'de loglanır
+                    Log.i(
+                        TAG,
+                        "Kalp atışı: durum=$micState engineVar=${engine != null} ekranAçık=${screenIsOn()}"
+                    )
                     if (screenIsOn()) continue
+
+                    // YENİ: sessiz ölüm sigortası. Engine "LISTENING" gözüküp
+                    // içeriden ölmüş olabilir (kütüphane hatayı bize
+                    // bildirmiyorsa bunu dışarıdan bilmek imkânsız).
+                    // 5 dakikadır kesintisiz dinliyorsa engine'i tazeliyoruz:
+                    // ~1-2 saniyelik bir dinleme boşluğu oluşur, karşılığında
+                    // hiçbir sessiz ölüm 5 dakikadan uzun sürmez.
+                    if (micState == MicState.LISTENING && engine != null) {
+                        listeningTicks++
+                        if (listeningTicks >= RECYCLE_TICKS) {
+                            Log.w(TAG, "Periyodik tazeleme: engine 5 dk'dır dinliyordu, tazeleniyor")
+                            listeningTicks = 0
+                            micState = MicState.RECOVERING
+                            micMutex.withLock { stopEngineSafely() }
+                            takeMic()
+                            continue
+                        }
+                    } else {
+                        listeningTicks = 0
+                    }
+
                     when {
                         micState == MicState.RELEASED -> {
                             Log.w(TAG, "Watchdog: ekran kapalı ama dinleme yok → başlatılıyor")
@@ -570,17 +605,36 @@ class WakeWordService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // DEĞİŞTİ: IMPORTANCE_LOW kanal bazı ROM'lar status bar'da sadece
+            // küçük bir nokta olarak gösteriyordu. DEFAULT importance +
+            // ses/titreme kapalı: ikon status bar'da GÖRÜNÜR ama sessizdir.
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 "Uyan Dinleme",
-                NotificationManager.IMPORTANCE_LOW
+                NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
                 description = "Ekran kapalıyken uyan kelimesini dinler"
                 setShowBadge(false)
+                setSound(null, null)    // ses yok
+                enableVibration(false)  // titreme yok
+                enableLights(false)     // ışık yok
             }
             val nm = getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(channel)
         }
+    }
+
+    /**
+     * YENİ: Duruma göre bildirim ikonu — durum çubuğundan tek bakışta
+     * anlaşılır:
+     *  - mikrofon ikonu  = dinliyor (hotword aktif)
+     *  - senkron ikonu   = dinleme başlatılmaya çalışılıyor
+     *  - bekleme ikonu   = mikrofon boşta (ekran açık / arama sürüyor)
+     */
+    private fun statusIcon(): Int = when (micState) {
+        MicState.LISTENING -> android.R.drawable.ic_btn_speak_now
+        MicState.RECOVERING -> android.R.drawable.ic_popup_sync
+        else -> android.R.drawable.ic_media_pause
     }
 
     private fun createNotification(text: String): Notification {
@@ -593,7 +647,7 @@ class WakeWordService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Uyan Wake Word")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setSmallIcon(statusIcon())
             .setContentIntent(pending)
             .setOngoing(true)
             .setSilent(true)
