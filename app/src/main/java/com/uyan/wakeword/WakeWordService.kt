@@ -62,6 +62,9 @@ import java.util.Locale
  *     motor ölümlerine" karşı engine 5 dakikada bir tazelenir
  *  8. Durum ikonu + kalp atışı  : bildirim ikonu dinleme durumunu gösterir
  *     (mikrofon = dinliyor); her 60 sn'de durum logcat'e yazılır
+ *  9. Crash guard (v3)          : kütüphanenin kendi coroutine'i içinde fırlayıp
+ *     process'i öldüren "Failed to initialize AudioRecord" gibi hatalar artık
+ *     yutulur; motor geri çekilerek (backoff) otomatik onarılır
  *
  * "uyan" duyulunca: ekranı uyandırır, Termux'u açar,
  * "Termux açıldı" diye sesli bildirir (Google TTS).
@@ -111,6 +114,10 @@ class WakeWordService : Service() {
     private var detectionJob: Job? = null
     private var startJob: Job? = null       // YENİ: başlatma/retry döngüsü
     private var watchdogJob: Job? = null    // YENİ: kendi kendine toparlama
+    private var recoveryJob: Job? = null    // v3: motor içi çökme sonrası gecikmeli toparlama
+
+    @Volatile
+    private var engineFailureCount = 0      // v3: üst üste motor içi hata sayısı (backoff için)
 
     @Volatile
     private var micState: MicState = MicState.RELEASED   // YENİ
@@ -140,6 +147,8 @@ class WakeWordService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // v3: kütüphane içi çökmeleri yutan koruma — process'i öldürmesin
+        installCrashGuard()
         createNotificationChannel()
         // TTS'i servisle birlikte başlat; algılama anında hazır olsun
         initTts()
@@ -274,6 +283,8 @@ class WakeWordService : Service() {
         micState = if (pauseForCall) MicState.PAUSED_CALL else MicState.RELEASED
         startJob?.cancel()
         startJob = null
+        recoveryJob?.cancel()   // v3
+        recoveryJob = null
         // Engine'i güvenle kapat: collector iptal edilip bitmesi beklenir,
         // sonra stop/release çağrılır (native çökme yarışı önlenir)
         serviceScope.launch {
@@ -308,6 +319,10 @@ class WakeWordService : Service() {
             } catch (ex: Exception) {
                 Log.w(TAG, "engine.stop() hatası", ex)
             }
+            // v3: motorun iç pipeline'ının sürmekte olan inference'ını bitirmesine
+            // kısa süre tanı; release() ile yarışı azaltır (OrtSession.run
+            // içindeki SIGSEGV riski)
+            delay(300)
             try {
                 e.release()
             } catch (ex: Exception) {
@@ -449,6 +464,8 @@ class WakeWordService : Service() {
                     // ~1-2 saniyelik bir dinleme boşluğu oluşur, karşılığında
                     // hiçbir sessiz ölüm 5 dakikadan uzun sürmez.
                     if (micState == MicState.LISTENING && engine != null) {
+                        // v3: bir dakikayı sorunsuz geçirdiyse hata sayacını sıfırla
+                        engineFailureCount = 0
                         listeningTicks++
                         if (listeningTicks >= RECYCLE_TICKS) {
                             Log.w(TAG, "Periyodik tazeleme: engine 5 dk'dır dinliyordu, tazeleniyor")
@@ -475,6 +492,68 @@ class WakeWordService : Service() {
                 } catch (e: Exception) {
                     Log.e(TAG, "Watchdog hatası", e)
                 }
+            }
+        }
+    }
+
+    // ---- v3: motor içi çökmelere karşı process koruması ----
+
+    /**
+     * KRİTİK DÜZELTME (crash.txt analizi):
+     *
+     * "Failed to initialize AudioRecord" (AudioRecorder.kt:64) hatası
+     * kütüphanenin KENDİ coroutine'inin içinde fırlıyor — WakeWordEngine
+     * kendi scope'unu CoroutineExceptionHandler'sız kuruyor. Bu hata bizim
+     * try/catch'lerimize ve .catch'imize ULAŞMIYOR; doğrudan process'i
+     * öldürüyor. Log'daki kalıp: process yeniden başlıyor → mikrofon bu
+     * sırada Termux script'inde → init yine başarısız → 2 saniyede bir
+     * öl-diren döngüsü... sabaha kadar. Hotword'ün geri gelmemesinin asıl
+     * nedeni buydu.
+     *
+     * Çözüm: varsayılan UncaughtExceptionHandler'a bir "guard" takıyoruz.
+     * Kütüphaneden gelen istisnalar YUTULUR (process yaşar) ve toparlama
+     * tetiklenir. Diğer tüm istisnalar gerçek handler'a devredilir.
+     */
+    private fun installCrashGuard() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            val fromLibrary = throwable.stackTrace.any { st ->
+                st.className.startsWith("com.rementia.openwakeword") ||
+                        st.className.startsWith("ai.onnxruntime")
+            }
+            if (fromLibrary) {
+                handleEngineInternalFailure(throwable)
+            } else {
+                previous?.uncaughtException(thread, throwable)
+            }
+        }
+        Log.i(TAG, "Crash guard kuruldu")
+    }
+
+    /**
+     * Motor içi hata geldi (process hayatta kaldı). Motor bozulmuş olabilir:
+     * durumdan çıkar, biraz bekle (backoff) ve temizce yeniden başlat.
+     */
+    private fun handleEngineInternalFailure(throwable: Throwable) {
+        if (micState != MicState.LISTENING && micState != MicState.RECOVERING) return
+
+        micState = MicState.RECOVERING
+        engineFailureCount++
+        val backoffMs = minOf(2_000L * engineFailureCount, 15_000L)
+        Log.e(
+            TAG,
+            "Motor içi hata yutuldu (#$engineFailureCount): ${throwable.message} " +
+                    "→ ${backoffMs} ms sonra yeniden denenecek"
+        )
+        updateNotification("Motor hatası; ${backoffMs / 1000} sn sonra yeniden denenecek")
+
+        recoveryJob?.cancel()
+        recoveryJob = serviceScope.launch {
+            delay(backoffMs)
+            micMutex.withLock { stopEngineSafely() }
+            if (micState == MicState.RECOVERING) {
+                Log.i(TAG, "Motor içi hata sonrası dinleme yeniden başlatılıyor")
+                takeMic()
             }
         }
     }
@@ -696,6 +775,8 @@ class WakeWordService : Service() {
         startJob = null
         watchdogJob?.cancel()
         watchdogJob = null
+        recoveryJob?.cancel()
+        recoveryJob = null
         detectionJob?.cancel()
         detectionJob = null
         try {
