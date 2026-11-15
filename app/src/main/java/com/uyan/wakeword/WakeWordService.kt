@@ -65,6 +65,12 @@ import java.util.Locale
  *  9. Crash guard (v3)          : kütüphanenin kendi coroutine'i içinde fırlayıp
  *     process'i öldüren "Failed to initialize AudioRecord" gibi hatalar artık
  *     yutulur; motor geri çekilerek (backoff) otomatik onarılır
+ * 10. Dinleme wake lock'u (v4)  : dinlerken PARTIAL_WAKE_LOCK tutulur. Hipotez:
+ *     ROM'un kilit ekranı temizliği wake lock tutan uygulamaları atlıyor
+ *     (gece temizlenen adbclipboard ve tasks'in wake lock'u yoktu). Test:
+ *     lock tutulurken uyan temizlikten kurtulursa hipotez doğrulanır.
+ *     Ekran açıkken mikrofon bırakıldığı için kilit de bırakılır; pil etkisi
+ *     yalnızca ekran kapalı dinleme süresiyle sınırlı kalır.
  *
  * "uyan" duyulunca: ekranı uyandırır, Termux'u açar,
  * "Termux açıldı" diye sesli bildirir (Google TTS).
@@ -137,6 +143,11 @@ class WakeWordService : Service() {
     private val micMutex = Mutex()
 
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // v4: dinleme süresince tutulan kalıcı wake lock — vendor temizlikten
+    // korunma testi (holdListenLock/dropListenLock'a bakın)
+    private var listenLock: PowerManager.WakeLock? = null
+
     private var screenReceiver: BroadcastReceiver? = null
     private var phoneReceiver: BroadcastReceiver? = null   // YENİ
 
@@ -281,6 +292,7 @@ class WakeWordService : Service() {
     /** Mikrofonu bırak: başka uygulama (sesle erişim, Hey Google) kullanabilsin */
     private fun releaseMic(pauseForCall: Boolean = false) {
         micState = if (pauseForCall) MicState.PAUSED_CALL else MicState.RELEASED
+        dropListenLock()   // v4: dinleme yokken kilit tutulmaz
         startJob?.cancel()
         startJob = null
         recoveryJob?.cancel()   // v3
@@ -355,6 +367,7 @@ class WakeWordService : Service() {
         while (micState == MicState.RECOVERING && attempt < MAX_START_ATTEMPTS) {
             // Bu sırada ekran açıldıysa politikaya göre beklemede kal
             if (screenIsOn()) {
+                dropListenLock()   // v4: önceki dinlemeden kalıntı varsa bırak
                 micState = MicState.RELEASED
                 updateNotification("Beklemede (ekran açık, mikrofon boşta)")
                 return
@@ -379,7 +392,8 @@ class WakeWordService : Service() {
                 engine = newEngine
                 watchDetections(newEngine)
                 micState = MicState.LISTENING
-                Log.i(TAG, "Dinleme başladı (deneme $attempt)")
+                holdListenLock()   // v4: vendor temizlikten korunma testi
+                Log.i(TAG, "Dinleme başladı (deneme $attempt, wake lock tutuluyor)")
                 updateNotification("Dinliyor: uyan (ekran kapalı)")
                 return
             } catch (e: CancellationException) {
@@ -400,6 +414,7 @@ class WakeWordService : Service() {
         }
 
         if (micState == MicState.RECOVERING) {
+            dropListenLock()   // v4: dinleme başlatılamadı, kilit tutma
             micState = MicState.RELEASED
             Log.w(TAG, "Dinleme $MAX_START_ATTEMPTS denemede başlatılamadı; watchdog yeniden deneyecek")
             updateNotification("Mikrofon alınamadı; periyodik olarak yeniden denenecek")
@@ -680,6 +695,39 @@ class WakeWordService : Service() {
         }
     }
 
+    // ---- v4: dinleme wake lock'u (vendor temizlikten korunma testi) ----
+
+    /**
+     * v4: Dinleme sürerken kalıcı PARTIAL_WAKE_LOCK tutulur.
+     *
+     * Hipotez: ROM'un kilit ekranı temizliği wake lock tutan uygulamaları
+     * atlıyor. Gece temizlenen adbclipboard ve tasks'in wake lock'u yoktu;
+     * uyan ise temizlendi. Hipotez doğrulanmış değil — test etmesi ucuz:
+     * lock tutulurken uyan temizlikten kurtulursa doğrulanmış olur.
+     *
+     * Pil notu: sınırsız acquire bilinçli tercih. Kilit yalnızca dinleme
+     * BAŞARIYLA başladığında tutulur; releaseMic(), onDestroy() ve deneme
+     * döngüsünün RELEASED'a çıktığı tüm noktalarda bırakılır. Ekran açıkken
+     * mikrofonu bıraktığımız için kilit de bırakılır — etkisi ekran kapalı
+     * dinleme süresiyle sınırlı (AudioRecord zaten CPU'yu uyanık tutuyor).
+     *
+     * Doğrulama: adb shell dumpsys power | grep Uyan:Listen
+     */
+    @Synchronized private fun holdListenLock() {
+        if (listenLock?.isHeld == true) return
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        listenLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Uyan:Listen")
+            .apply { setReferenceCounted(false); acquire() }
+        Log.i(TAG, "Dinleme wake lock'u alındı")
+    }
+
+    @Synchronized private fun dropListenLock() {
+        val hadLock = listenLock?.isHeld == true
+        listenLock?.let { if (it.isHeld) it.release() }
+        listenLock = null
+        if (hadLock) Log.i(TAG, "Dinleme wake lock'u bırakıldı")
+    }
+
     // ---- Bildirim altyapısı ----
 
     private fun createNotificationChannel() {
@@ -806,6 +854,7 @@ class WakeWordService : Service() {
         wakeLock?.let {
             if (it.isHeld) it.release()
         }
+        dropListenLock()   // v4
         tts?.stop()
         tts?.shutdown()
         tts = null
