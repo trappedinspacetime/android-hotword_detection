@@ -13,6 +13,13 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- Android 10+ ekran kapalıyken Termux'u açabilmek için (kilit üstü açılma muafiyeti) -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- v7: Termux'ta programları arayüz açmadan arka planda başlatmak için -->
+    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
+
+    <!-- Android 11+ paket görünürlüğü: Termux'u görebilmek için -->
+    <queries>
+        <package android:name="com.termux" />
+    </queries>
 
     <application
         android:allowBackup="true"

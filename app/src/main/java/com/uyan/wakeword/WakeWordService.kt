@@ -90,6 +90,30 @@ class WakeWordService : Service() {
         private const val MAX_START_ATTEMPTS = 30         // start() için deneme sayısı
         private const val WATCHDOG_INTERVAL_MS = 60_000L  // kendi kendine toparlama aralığı
         private const val CALL_RESUME_DELAY_MS = 3_000L   // arama bitince bekleme süresi
+
+        // v6: Ekran açıkken de "hey uyan"ı dinle (arama/bildirimle ekran açılınca
+        // dinleme kopmasın). false yapılırsa eski davranış: ekran açılınca mikrofon bırakılır.
+        // v7: ekran açıkken Termux'taki programlar dinler; uyan yalnızca ekran kapalıyken.
+        private const val KEEP_LISTENING_WHEN_SCREEN_ON = false
+
+        // v7: Ekran her açıldığında Termux programlarının çalıştığından emin ol.
+        // Termux ARAYÜZÜ açılmaz (gelen arama ekranını örtmesin diye); program arka
+        // planda Termux'un RUN_COMMAND servisiyle başlatılır. Script zaten çalışıyorsa
+        // hiçbir şey yapmaz (uyan_baslat.sh içindeki pgrep koruması).
+        private const val ENSURE_TERMUX_ON_SCREEN_ON = true
+        // RUN_COMMAND çalışmazsa (izin/ayar eksik) false yap: eski yola (Termux'u aç +
+        // ana ekrana dön) düşer. NOT: Termux'ta allow-external-apps kapalıysa istek
+        // sessizce reddedilir ve uyan bunu anlayamaz; kurulumu aşağıdaki adımlarla test et.
+        private const val USE_RUN_COMMAND = true
+        private const val ENSURE_MIN_INTERVAL_MS = 30_000L
+        private const val TERMUX_HOME = "/data/data/com.termux/files/home"
+        private const val TERMUX_BASH = "/data/data/com.termux/files/usr/bin/bash"
+        private const val TERMUX_START_SCRIPT = "$TERMUX_HOME/uyan_baslat.sh"
+
+        // v6: "hey uyan" sonrası Termux açılır, bu kadar ms sonra ana ekrana dönülür
+        // (Termux oturumu/script'i arka planda çalışmaya devam eder).
+        // 0 yapılırsa ana ekrana dönülmez. Script geç başlıyorsa artır.
+        private const val GO_HOME_DELAY_MS = 2_500L
         private const val RECYCLE_TICKS = 5               // YENİ: 5 tick x 60 sn = 5 dk'da bir engine tazeleme
 
         // v5: servis GERÇEKTEN çalışıyor mu? (SharedPreferences bayrağı force-stop
@@ -133,6 +157,15 @@ class WakeWordService : Service() {
 
     @Volatile
     private var micState: MicState = MicState.RELEASED   // YENİ
+
+    // v6: "hey uyan" algılanınca mikrofon Termux'a devredilir; ekran kapanana kadar
+    // geri alınmaz (Termux'taki ses programı mikrofonu kullanabilsin diye).
+    @Volatile
+    private var handoffToTermux = false
+
+    // v7: Termux programlarını denetleme isteğinin son zamanı (tekrar tekrar tetiklemesin)
+    @Volatile
+    private var lastEnsureMs = 0L
 
     // DEĞİŞTİ: CoroutineExceptionHandler eklendi. Eskiden bu scope'a düşen bir
     // hata process'i öldürüyordu (arama sonrası ölümün asıl nedeni);
@@ -215,11 +248,18 @@ class WakeWordService : Service() {
                 when (intent?.action) {
                     Intent.ACTION_SCREEN_OFF -> {
                         Log.i(TAG, "Ekran kapandı → mikrofon alınır, dinleme başlar")
+                        handoffToTermux = false
                         takeMic()
                     }
                     Intent.ACTION_SCREEN_ON -> {
-                        Log.i(TAG, "Ekran açıldı → mikrofon bırakılır")
-                        releaseMic()
+                        if (handoffToTermux || !KEEP_LISTENING_WHEN_SCREEN_ON) {
+                            Log.i(TAG, "Ekran açıldı → mikrofon bırakılır")
+                            releaseMic()
+                        } else {
+                            // v6: ekranı arama/bildirim/kullanıcı açmış olabilir; dinlemeye devam
+                            Log.i(TAG, "Ekran açıldı (algılama yok) → dinleme sürüyor")
+                        }
+                        if (ENSURE_TERMUX_ON_SCREEN_ON) ensureTermuxPrograms()
                     }
                 }
             }
@@ -253,7 +293,8 @@ class WakeWordService : Service() {
                             // için kısa bir bekleme; sonra dinleme geri gelir
                             serviceScope.launch {
                                 delay(CALL_RESUME_DELAY_MS)
-                                if (micState == MicState.RELEASED && !screenIsOn()) {
+                                if (micState == MicState.RELEASED && !handoffToTermux &&
+                                    (!screenIsOn() || KEEP_LISTENING_WHEN_SCREEN_ON)) {
                                     Log.i(TAG, "Arama sonrası dinleme yeniden başlatılıyor")
                                     takeMic()
                                 }
@@ -271,7 +312,7 @@ class WakeWordService : Service() {
         (getSystemService(POWER_SERVICE) as PowerManager).isInteractive
 
     private fun applyMicPolicy() {
-        if (screenIsOn()) {
+        if (screenIsOn() && !KEEP_LISTENING_WHEN_SCREEN_ON) {
             Log.i(TAG, "Başlangıç: ekran açık → beklemede")
             releaseMic()
         } else {
@@ -589,8 +630,21 @@ class WakeWordService : Service() {
     // ---- Algılama sonrası akış ----
 
     private fun onWakeWordDetected() {
-        // 1. Ekranı uyandır (SCREEN_ON gelince mikrofon otomatik bırakılır)
+        // 0. v6: mikrofonu Termux'a devret. Ekran zaten açıksa SCREEN_ON gelmeyeceği
+        //    için bırakma işlemini burada açıkça yapıyoruz.
+        handoffToTermux = true
+        releaseMic()
+
+        // 1. Ekranı uyandır
         acquireWakeLock()
+
+        // 1b. v7: programları arayüz açmadan arka planda başlat. Başarılıysa ana ekran
+        //     temiz kalır; olmazsa aşağıdaki eski yol (Termux'u aç + ana ekrana dön) çalışır.
+        if (startTermuxProgramsInBackground()) {
+            lastEnsureMs = android.os.SystemClock.elapsedRealtime()
+            speak("Termux açıldı")
+            return
+        }
 
         // 2. Kilit ekranından bile açılması için tam ekran bildirimi gönder
         postWakeNotification()
@@ -600,6 +654,13 @@ class WakeWordService : Service() {
         if (opened) {
             // 4. Sesli bildir
             speak("Termux açıldı")
+            // 5. v6: kısa süre sonra ana ekrana dön (Termux arka planda çalışır)
+            if (GO_HOME_DELAY_MS > 0) {
+                serviceScope.launch {
+                    delay(GO_HOME_DELAY_MS)
+                    goHome()
+                }
+            }
         } else {
             speak("Termux bulunamadı")
             updateNotification("Hata: Termux kurulu değil")
@@ -634,6 +695,59 @@ class WakeWordService : Service() {
             // tam ekran bildirimi (full screen intent) devralır
             Log.w(TAG, "Doğrudan açılamadı, kilit üstü bildirim devralır", e)
             false
+        }
+    }
+
+    /** v7: Ekran açıldığında (hangi sebeple olursa olsun) Termux programlarını denetle. */
+    private fun ensureTermuxPrograms() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastEnsureMs < ENSURE_MIN_INTERVAL_MS) return
+        lastEnsureMs = now
+        serviceScope.launch {
+            delay(1_500)   // arama vb. ekran olayları otursun
+            val ok = startTermuxProgramsInBackground()
+            Log.i(TAG, "Ekran açıldı → Termux programları denetimi: " +
+                    if (ok) "istek gönderildi" else "gönderilemedi")
+        }
+    }
+
+    /**
+     * v7: Termux'un RUN_COMMAND servisiyle uyan_baslat.sh'ı ARKA PLANDA çalıştırır.
+     * Gerekenler: Termux'ta allow-external-apps=true ve uyan'a
+     * com.termux.permission.RUN_COMMAND izni (adb shell pm grant ...).
+     */
+    private fun startTermuxProgramsInBackground(): Boolean {
+        if (!USE_RUN_COMMAND) return false
+        return try {
+            val intent = Intent("com.termux.RUN_COMMAND").apply {
+                setClassName(TERMUX_PACKAGE, "com.termux.app.RunCommandService")
+                putExtra("com.termux.RUN_COMMAND_PATH", TERMUX_BASH)
+                putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf(TERMUX_START_SCRIPT))
+                putExtra("com.termux.RUN_COMMAND_WORKDIR", TERMUX_HOME)
+                putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
+            }
+            val started = startService(intent) != null
+            Log.i(TAG, "Termux RUN_COMMAND: ${if (started) "gönderildi" else "servis bulunamadı"}")
+            started
+        } catch (e: Exception) {
+            // SecurityException: RUN_COMMAND izni yok; diğerleri: Termux yok vb.
+            Log.w(TAG, "Termux RUN_COMMAND başarısız: ${e.javaClass.simpleName}: ${e.message}")
+            false
+        }
+    }
+
+    /** v6: temiz ana ekran. Arka plandan activity başlatma izni Termux'u açanla aynı. */
+    private fun goHome() {
+        try {
+            val home = Intent(Intent.ACTION_MAIN)
+                .addCategory(Intent.CATEGORY_HOME)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(home)
+            // Ana ekran temiz kalsın: "Uyan! Termux açılıyor" bildirimi kaldırılır
+            getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID + 1)
+            Log.i(TAG, "Ana ekrana dönüldü")
+        } catch (e: Exception) {
+            Log.w(TAG, "Ana ekrana dönülemedi", e)
         }
     }
 
