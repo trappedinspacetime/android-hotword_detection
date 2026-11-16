@@ -86,6 +86,25 @@ class MainActivity : AppCompatActivity() {
         }
 
         updateStatus(if (isServiceRunning()) "Dinleniyor..." else "Durduruldu")
+
+        // v5: Termux bekçisi `am start -n com.uyan.wakeword/.MainActivity --ez autostart true`
+        // ile çağırır. Servis exported=false olduğu için shell/Termux doğrudan
+        // başlatamaz; activity ön planda olduğu için servisi buradan başlatmak
+        // Android 11 mikrofon (while-in-use) kısıtına takılmaz.
+        if (intent.getBooleanExtra("autostart", false)) {
+            handleAutostart()
+        }
+    }
+
+    private fun handleAutostart() {
+        val granted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted && !WakeWordService.isRunning) {
+            startService()
+        }
+        // Servis başladıktan kısa süre sonra arayüzü kapat (ekranı meşgul etme)
+        window.decorView.postDelayed({ finish() }, 1500)
     }
 
     private fun checkPermissionsAndStart() {
@@ -122,10 +141,7 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "Dinleme durduruldu", Toast.LENGTH_SHORT).show()
     }
 
-    private fun isServiceRunning(): Boolean {
-        val prefs = getSharedPreferences("uyan", MODE_PRIVATE)
-        return prefs.getBoolean("service_running", false)
-    }
+    private fun isServiceRunning(): Boolean = WakeWordService.isRunning
 
     private fun updateStatus(text: String) {
         statusText.text = text

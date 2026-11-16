@@ -92,6 +92,12 @@ class WakeWordService : Service() {
         private const val CALL_RESUME_DELAY_MS = 3_000L   // arama bitince bekleme süresi
         private const val RECYCLE_TICKS = 5               // YENİ: 5 tick x 60 sn = 5 dk'da bir engine tazeleme
 
+        // v5: servis GERÇEKTEN çalışıyor mu? (SharedPreferences bayrağı force-stop
+        // sonrası bayat kalıyordu; süreç yeniden doğunca bu bayrak false olur)
+        @Volatile
+        var isRunning = false
+            private set
+
         fun start(context: Context) {
             val intent = Intent(context, WakeWordService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -177,6 +183,13 @@ class WakeWordService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
+
+        isRunning = true
+        // v5: wake lock artık servis ömrü boyunca tutulur (ekran açıkken de).
+        // ROM'un kilit ekranı temizliği "wakelock" tutanları atlıyor; kilit yalnızca
+        // dinlerken tutulunca, ekran kapanma anında (kilit henüz alınmamışken)
+        // temizliğe yakalanma ihtimali vardı.
+        holdListenLock()
 
         // Ekran açılıp kapanmasını izle ve mikrofonu buna göre yönet
         registerScreenReceiver()
@@ -713,7 +726,8 @@ class WakeWordService : Service() {
      *
      * Doğrulama: adb shell dumpsys power | grep Uyan:Listen
      */
-    @Synchronized private fun holdListenLock() {
+    @Synchronized
+    private fun holdListenLock() {
         if (listenLock?.isHeld == true) return
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         listenLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Uyan:Listen")
@@ -721,7 +735,11 @@ class WakeWordService : Service() {
         Log.i(TAG, "Dinleme wake lock'u alındı")
     }
 
-    @Synchronized private fun dropListenLock() {
+    @Synchronized
+    private fun dropListenLock(force: Boolean = false) {
+        // v5: normal akıştaki çağrılar (releaseMic vb.) kilidi bırakmaz;
+        // yalnızca onDestroy force=true ile bırakır.
+        if (!force) return
         val hadLock = listenLock?.isHeld == true
         listenLock?.let { if (it.isHeld) it.release() }
         listenLock = null
@@ -854,7 +872,8 @@ class WakeWordService : Service() {
         wakeLock?.let {
             if (it.isHeld) it.release()
         }
-        dropListenLock()   // v4
+        dropListenLock(force = true)   // v5: tek gerçek bırakma noktası
+        isRunning = false
         tts?.stop()
         tts?.shutdown()
         tts = null
