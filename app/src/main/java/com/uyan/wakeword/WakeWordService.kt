@@ -104,7 +104,7 @@ class WakeWordService : Service() {
         // RUN_COMMAND çalışmazsa (izin/ayar eksik) false yap: eski yola (Termux'u aç +
         // ana ekrana dön) düşer. NOT: Termux'ta allow-external-apps kapalıysa istek
         // sessizce reddedilir ve uyan bunu anlayamaz; kurulumu aşağıdaki adımlarla test et.
-        private const val USE_RUN_COMMAND = true
+        private const val USE_RUN_COMMAND = false
         private const val ENSURE_MIN_INTERVAL_MS = 30_000L
         private const val TERMUX_HOME = "/data/data/com.termux/files/home"
         private const val TERMUX_BASH = "/data/data/com.termux/files/usr/bin/bash"
@@ -113,7 +113,7 @@ class WakeWordService : Service() {
         // v6: "hey uyan" sonrası Termux açılır, bu kadar ms sonra ana ekrana dönülür
         // (Termux oturumu/script'i arka planda çalışmaya devam eder).
         // 0 yapılırsa ana ekrana dönülmez. Script geç başlıyorsa artır.
-        private const val GO_HOME_DELAY_MS = 2_500L
+        private const val GO_HOME_DELAY_MS = 6_000L
         private const val RECYCLE_TICKS = 5               // YENİ: 5 tick x 60 sn = 5 dk'da bir engine tazeleme
 
         // v5: servis GERÇEKTEN çalışıyor mu? (SharedPreferences bayrağı force-stop
