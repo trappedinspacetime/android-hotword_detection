@@ -105,6 +105,13 @@ class WakeWordService : Service() {
         // ana ekrana dön) düşer. NOT: Termux'ta allow-external-apps kapalıysa istek
         // sessizce reddedilir ve uyan bunu anlayamaz; kurulumu aşağıdaki adımlarla test et.
         private const val USE_RUN_COMMAND = false
+
+        // v8: Android 11, ARKA PLANDAN başlayan (ör. sistemin START_STICKY yeniden başlatması)
+        // mikrofon servisine ömür boyu mikrofon vermez: "Failed to initialize AudioRecord"
+        // sonsuza kadar sürer, servis ise "dinliyor" sanır. Bu durum tespit edilince servis
+        // MainActivity üzerinden (ekran AÇIKKEN, ön planda) durdurulup yeniden başlatılır.
+        private const val DENIED_STREAK_FOR_RELAUNCH = 3          // ardışık AudioRecord hatası
+        private const val RELAUNCH_MIN_INTERVAL_MS = 600_000L     // en fazla 10 dk'da bir
         private const val ENSURE_MIN_INTERVAL_MS = 30_000L
         private const val TERMUX_HOME = "/data/data/com.termux/files/home"
         private const val TERMUX_BASH = "/data/data/com.termux/files/usr/bin/bash"
@@ -153,6 +160,10 @@ class WakeWordService : Service() {
     private var recoveryJob: Job? = null    // v3: motor içi çökme sonrası gecikmeli toparlama
 
     @Volatile
+    @Volatile private var micDeniedStreak = 0        // v8: ardışık "AudioRecord başlatılamadı"
+    @Volatile private var lastDeniedMs = 0L
+    @Volatile private var stickyRestart = false      // v8: sistem arka planda yeniden başlattı
+    @Volatile private var lastRelaunchMs = 0L
     private var engineFailureCount = 0      // v3: üst üste motor içi hata sayısı (backoff için)
 
     @Volatile
@@ -205,6 +216,11 @@ class WakeWordService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent == null) {
+            // Sistem (START_STICKY) arka planda yeniden başlattı → mikrofon izni olmayabilir
+            stickyRestart = true
+            Log.w(TAG, "Sistem yeniden başlattı (arka plan): ekran açılınca ön planda yeniden başlatılacak")
+        }
         val notification = createNotification("Uyan servisi başlatılıyor...")
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -260,6 +276,7 @@ class WakeWordService : Service() {
                             Log.i(TAG, "Ekran açıldı (algılama yok) → dinleme sürüyor")
                         }
                         if (ENSURE_TERMUX_ON_SCREEN_ON) ensureTermuxPrograms()
+                        maybeRelaunchInForeground()
                     }
                 }
             }
@@ -524,6 +541,10 @@ class WakeWordService : Service() {
                         TAG,
                         "Kalp atışı: durum=$micState engineVar=${engine != null} ekranAçık=${screenIsOn()}"
                     )
+                    if (micState == MicState.LISTENING &&
+                        SystemClock.elapsedRealtime() - lastDeniedMs > 60_000L) {
+                        micDeniedStreak = 0
+                    }
                     if (screenIsOn()) continue
 
                     // YENİ: sessiz ölüm sigortası. Engine "LISTENING" gözüküp
@@ -608,6 +629,10 @@ class WakeWordService : Service() {
 
         micState = MicState.RECOVERING
         engineFailureCount++
+        if (throwable.message?.contains("Failed to initialize AudioRecord") == true) {
+            micDeniedStreak++
+            lastDeniedMs = SystemClock.elapsedRealtime()
+        }
         val backoffMs = minOf(2_000L * engineFailureCount, 15_000L)
         Log.e(
             TAG,
@@ -695,6 +720,34 @@ class WakeWordService : Service() {
             // tam ekran bildirimi (full screen intent) devralır
             Log.w(TAG, "Doğrudan açılamadı, kilit üstü bildirim devralır", e)
             false
+        }
+    }
+
+    /**
+     * v8: Servis arka planda doğduysa (sticky yeniden başlatma) ya da mikrofon sürekli
+     * alınamıyorsa, ekran AÇIKKEN MainActivity'yi ön plana getirip servisi durdurup yeniden
+     * başlatır; yeni servis ön planda doğduğu için mikrofon yetkisi alır.
+     * Arama sürerken ve "hey uyan" devri sırasında arayüz açılmaz.
+     */
+    private fun maybeRelaunchInForeground() {
+        if (!(stickyRestart || micDeniedStreak >= DENIED_STREAK_FOR_RELAUNCH)) return
+        serviceScope.launch {
+            delay(1_500)     // arama olayları otursun
+            if (micState == MicState.PAUSED_CALL || handoffToTermux || !screenIsOn()) return@launch
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastRelaunchMs < RELAUNCH_MIN_INTERVAL_MS) return@launch
+            lastRelaunchMs = now
+            Log.w(TAG, "Mikrofon alınamıyor (sticky=$stickyRestart, hata serisi=$micDeniedStreak) " +
+                    "→ servis ön planda yeniden başlatılıyor")
+            try {
+                val i = Intent(this@WakeWordService, MainActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    .putExtra("autostart", true)
+                    .putExtra("restart", true)
+                startActivity(i)
+            } catch (e: Exception) {
+                Log.w(TAG, "Ön planda yeniden başlatma başarısız", e)
+            }
         }
     }
 

@@ -92,19 +92,26 @@ class MainActivity : AppCompatActivity() {
         // başlatamaz; activity ön planda olduğu için servisi buradan başlatmak
         // Android 11 mikrofon (while-in-use) kısıtına takılmaz.
         if (intent.getBooleanExtra("autostart", false)) {
-            handleAutostart()
+            handleAutostart(intent.getBooleanExtra("restart", false))
         }
     }
 
-    private fun handleAutostart() {
+    private fun handleAutostart(restart: Boolean) {
         val granted = ContextCompat.checkSelfPermission(
             this, Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
-        if (granted && !WakeWordService.isRunning) {
-            startService()
+        if (granted) {
+            if (restart && WakeWordService.isRunning) {
+                // v8: mevcut servis arka planda doğmuş (mikrofon alamıyor); durdur,
+                // bu activity ön plandayken yeniden başlat → ön planda doğar.
+                WakeWordService.stop(this)
+                window.decorView.postDelayed({ startService() }, 1500)
+            } else if (!WakeWordService.isRunning) {
+                startService()
+            }
         }
         // Servis başladıktan kısa süre sonra arayüzü kapat (ekranı meşgul etme)
-        window.decorView.postDelayed({ finish() }, 1500)
+        window.decorView.postDelayed({ finish() }, if (restart) 4000L else 1500L)
     }
 
     private fun checkPermissionsAndStart() {
