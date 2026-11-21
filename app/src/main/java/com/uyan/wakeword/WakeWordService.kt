@@ -159,11 +159,11 @@ class WakeWordService : Service() {
     private var watchdogJob: Job? = null    // YENİ: kendi kendine toparlama
     private var recoveryJob: Job? = null    // v3: motor içi çökme sonrası gecikmeli toparlama
 
-    @Volatile
     @Volatile private var micDeniedStreak = 0        // v8: ardışık "AudioRecord başlatılamadı"
     @Volatile private var lastDeniedMs = 0L
     @Volatile private var stickyRestart = false      // v8: sistem arka planda yeniden başlattı
     @Volatile private var lastRelaunchMs = 0L
+    @Volatile
     private var engineFailureCount = 0      // v3: üst üste motor içi hata sayısı (backoff için)
 
     @Volatile
